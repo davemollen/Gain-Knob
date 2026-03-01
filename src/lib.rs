@@ -1,0 +1,163 @@
+use nih_plug::prelude::*;
+use nih_plug_slint::SlintEditor;
+use std::sync::Arc;
+
+mod gui;
+
+#[derive(Params)]
+pub struct GainKnobParams {
+    #[id = "gain"]
+    pub gain: FloatParam,
+}
+
+impl Default for GainKnobParams {
+    fn default() -> Self {
+        Self {
+            gain: FloatParam::new(
+                "Gain",
+                util::db_to_gain(0.0),
+                FloatRange::Skewed {
+                    min: util::db_to_gain(-60.0),
+                    max: util::db_to_gain(6.0),
+                    factor: FloatRange::gain_skew_factor(-60.0, 6.0),
+                },
+            )
+            .with_smoother(SmoothingStyle::Logarithmic(50.0))
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_gain_to_db(2))
+            .with_string_to_value(formatters::s2v_f32_gain_to_db()),
+        }
+    }
+}
+
+pub struct GainKnob {
+    params: Arc<GainKnobParams>,
+}
+
+impl Default for GainKnob {
+    fn default() -> Self {
+        Self {
+            params: Arc::new(GainKnobParams::default()),
+        }
+    }
+}
+
+impl Plugin for GainKnob {
+    const NAME: &'static str = "Gain Knob";
+    const VENDOR: &'static str = "AmbiosDSP";
+    const URL: &'static str = "www.ambiosdsp.com";
+    const EMAIL: &'static str = "info@ambiosdsp.com";
+
+    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+
+    const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[
+        AudioIOLayout {
+            main_input_channels: NonZeroU32::new(2),
+            main_output_channels: NonZeroU32::new(2),
+            ..AudioIOLayout::const_default()
+        },
+    ];
+
+    const SAMPLE_ACCURATE_AUTOMATION: bool = true;
+
+    type SysExMessage = ();
+    type BackgroundTask = ();
+
+    fn params(&self) -> Arc<dyn Params> {
+        self.params.clone()
+    }
+
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+        Some(Box::new(
+            SlintEditor::with_factory(
+                || gui::AppWindow::new(),
+                (300, 360),
+            )
+            .with_event_loop({
+                let params = self.params.clone();
+
+                move |window_handler, _setter, _window| {
+                    let component = window_handler.component();
+
+                    // Plugin -> UI: sync gain knob position
+                    let normalized = params.gain.unmodulated_normalized_value();
+                    component.set_gain_value(normalized);
+
+                    // Plugin -> UI: format dB string for readout
+                    let db = util::gain_to_db(params.gain.unmodulated_plain_value());
+                    let db_str = if db <= -59.0 {
+                        "-inf dB".into()
+                    } else {
+                        format!("{:.1} dB", db)
+                    };
+                    component.set_gain_db(db_str.into());
+
+                    // UI -> Plugin: knob drag callbacks
+                    {
+                        let params_clone = params.clone();
+                        let context = window_handler.context().clone();
+                        component.on_gain_begin_drag(move || {
+                            let setter = ParamSetter::new(&*context);
+                            setter.begin_set_parameter(&params_clone.gain);
+                        });
+                    }
+
+                    {
+                        let params_clone = params.clone();
+                        let context = window_handler.context().clone();
+                        component.on_gain_changed(move |value| {
+                            let setter = ParamSetter::new(&*context);
+                            setter.set_parameter_normalized(&params_clone.gain, value);
+                        });
+                    }
+
+                    {
+                        let params_clone = params.clone();
+                        let context = window_handler.context().clone();
+                        component.on_gain_end_drag(move || {
+                            let setter = ParamSetter::new(&*context);
+                            setter.end_set_parameter(&params_clone.gain);
+                        });
+                    }
+                }
+            }),
+        ))
+    }
+
+    fn process(
+        &mut self,
+        buffer: &mut Buffer,
+        _aux: &mut AuxiliaryBuffers,
+        _context: &mut impl ProcessContext<Self>,
+    ) -> ProcessStatus {
+        for channel_samples in buffer.iter_samples() {
+            let gain = self.params.gain.smoothed.next();
+            for sample in channel_samples {
+                *sample *= gain;
+            }
+        }
+        ProcessStatus::Normal
+    }
+}
+
+impl ClapPlugin for GainKnob {
+    const CLAP_ID: &'static str = "com.ambiosdsp.gain-knob";
+    const CLAP_DESCRIPTION: Option<&'static str> = Some("A clean single-knob gain plugin");
+    const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
+    const CLAP_SUPPORT_URL: Option<&'static str> = None;
+    const CLAP_FEATURES: &'static [ClapFeature] = &[
+        ClapFeature::AudioEffect,
+        ClapFeature::Stereo,
+        ClapFeature::Mono,
+        ClapFeature::Utility,
+    ];
+}
+
+impl Vst3Plugin for GainKnob {
+    const VST3_CLASS_ID: [u8; 16] = *b"GainKnobPlugABCD";
+    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
+        &[Vst3SubCategory::Fx, Vst3SubCategory::Tools];
+}
+
+nih_export_clap!(GainKnob);
+nih_export_vst3!(GainKnob);
